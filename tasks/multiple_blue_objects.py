@@ -11,12 +11,19 @@ Usage
                                 Print it, measure the black square's side with a
                                 ruler and set MARKER_CM below to that length.
 
+If camera_calib.npz (made by calibrate_camera.py) is next to this file, every frame
+is undistorted with it before anything else happens.
+
 Windows
     Tracker - left: camera with contours, bounding boxes, center trails, ball
               circle, labels and distances between blue objects
               right: black panel with (x, y) of each blue object, its position
               relative to the ball and distance traversed
-    Masks   - (toggle with 'm') the blue and ball HSV masks
+    Mono view - (toggle with 'w') black and white window: white outlines of the blue
+              objects with their (x, y), position relative to the ball and the
+              distance between them
+    Masks   - (toggle with 'm') the blue and ball HSV masks, white = pixels that
+              are counted as blue (or as the ball)
     Ball mask maker - (open with 'b') sliders for the ball's HSV range; left: camera
               with the ball found using the slider values, right: the mask
 
@@ -25,6 +32,7 @@ Keys
     c        clear trails and traversed distances
     r        reset the blue HSV range to the default
     m        toggle mask windows
+    w        toggle the black and white Mono view
     b        open the ball mask maker
                Enter / Space  use the slider values as the ball mask
                d              set the sliders back to the default range
@@ -34,6 +42,7 @@ Keys
 
 import itertools
 import math
+import os
 import sys
 from collections import deque
 
@@ -41,13 +50,14 @@ import cv2
 import numpy as np
 
 # Settings: edit these instead of passing command-line options
-SOURCE = 0          # 0 = MacBook Air camera (an iPhone via Continuity Camera may be 1)
+SOURCE = 0          # 0 = built-in webcam (a USB or phone camera may be 1)
 MARKER_CM = 5.0     # side length of the printed ArUco marker's black square in cm
 BALL_CM = 6.6       # tennis ball diameter in cm; the scale reference when no marker is visible
 MIN_BLUE_AREA = 600  # min blue blob area in px^2
 MIN_BALL_AREA = 300  # min ball blob area in px^2
 FRAME_W, FRAME_H = 1280, 720  # camera can do 1920x1080; 720p fits the screen and runs faster
 MIRROR = True      # flip the picture left-right so it moves like a mirror
+CALIB_FILE = "camera_calib.npz"  # from calibrate_camera.py; skipped if the file is missing
 
 ARUCO_DICT = cv2.aruco.DICT_4X4_50  # the only dictionary the tracker searches
 MARKER_ID = 0       # marker ID written by `python tracker.py marker`
@@ -79,6 +89,15 @@ def make_marker():
           f"square's side and set MARKER_CM to that length.")
 
 
+def load_calibration():
+    """Camera matrix, distortion coefficients and image size, or None if there is no file."""
+    if not os.path.exists(CALIB_FILE):
+        return None
+    data = np.load(CALIB_FILE)
+    size = tuple(int(v) for v in data["image_size"])
+    return data["camera_matrix"], data["dist_coeffs"], size
+
+
 class ScaleEstimator:
     """Pixels-per-cm from any visible ArUco marker, else from the ball's diameter."""
 
@@ -100,16 +119,16 @@ class ScaleEstimator:
             for c in corners_all:
                 c[..., 0] = gray.shape[1] - 1 - c[..., 0]
 
-        if corners_all:
+        if ball:
+            ppc = 2 * ball["radius"] / BALL_CM
+            self.source = "ball"
+        elif corners_all:
             sides = []
             for c in corners_all:
                 pts = c.reshape(4, 2)
                 sides.extend(np.linalg.norm(pts - np.roll(pts, -1, axis=0), axis=1))
             ppc = float(np.mean(sides)) / self.marker_cm
             self.source = "marker"
-        elif ball:
-            ppc = 2 * ball["radius"] / BALL_CM
-            self.source = "ball"
         else:
             ppc = None
             self.source = "held" if self.px_per_cm else None
@@ -353,6 +372,12 @@ def relative(obj_center, ball, scale):
     return f"{side} {abs(dx):.0f} {level} {abs(dy):.0f} d={d:.0f} px"
 
 
+def ball_area(ball):
+    """Ball area in cm^2 from its own size, so it stays the same near or far."""
+    ppc = 2 * ball["radius"] / BALL_CM
+    return f"{ball['area_px'] / ppc ** 2:.1f} cm^2"
+
+
 def put(img, text, org, color=WHITE, size=0.5, thickness=1):
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, size, (0, 0, 0), thickness + 2, cv2.LINE_AA)
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, size, color, thickness, cv2.LINE_AA)
@@ -388,7 +413,7 @@ def draw_camera(frame, result, scale):
         bc, r = pt(ball["center"]), int(round(ball["radius"]))
         cv2.circle(frame, bc, r, BALL_COLOR, 2)
         cv2.circle(frame, bc, 4, BALL_COLOR, -1)
-        label = f"Ball c=({bc[0]},{bc[1]}) r={r}px A={scale.area(ball['area_px'])}"
+        label = f"Ball c=({bc[0]},{bc[1]}) r={r}px A={ball_area(ball)}"
         (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         lx = min(max(bc[0] - r, 5), frame.shape[1] - tw - 5)
         put(frame, label, (lx, max(bc[1] - r - 10, 45)), BALL_COLOR)
@@ -400,7 +425,7 @@ def draw_camera(frame, result, scale):
     else:
         hud = "Scale: no marker or ball yet - showing px"
     put(frame, hud, (10, 25), size=0.6)
-    put(frame, "click blue to select | c clear | r reset | m masks | b ball mask | q quit",
+    put(frame, "click blue to select | c clear | r reset | m masks | w mono | b ball mask | q quit",
         (10, frame.shape[0] - 12), GRAY, size=0.45)
     return frame
 
@@ -418,7 +443,7 @@ def draw_panel(h, result, scale, panel_w=380):
         bc = pt(ball["center"])
         put(panel, f"Ball: ({bc[0]}, {bc[1]}) r={ball['radius']:.0f}px", (x0, y))
         y += 20
-        put(panel, f"      A={scale.area(ball['area_px'])}", (x0, y))
+        put(panel, f"      A={ball_area(ball)}", (x0, y))
     else:
         put(panel, "Ball: not detected", (x0, y), GRAY)
     y += 30
@@ -438,15 +463,58 @@ def draw_panel(h, result, scale, panel_w=380):
     return panel
 
 
+def draw_mono(shape, result, scale):
+    """Black and white window: white outlines of the blue objects on black."""
+    canvas = np.zeros(shape[:2], np.uint8)
+    tracks, ball = result["tracks"], result["ball"]
+
+    # distance between every two blue objects
+    for i, a in enumerate(tracks):
+        for b in tracks[i + 1:]:
+            cv2.line(canvas, pt(a.center), pt(b.center), 100, 1)
+            mid = ((a.center[0] + b.center[0]) / 2, (a.center[1] + b.center[1]) / 2)
+            put(canvas, scale.length(math.dist(a.center, b.center)), pt(mid), 180, 0.45)
+
+    # each blue object: outline, centre, (x, y) and position relative to the ball
+    for t in tracks:
+        cv2.drawContours(canvas, [t.obj["contour"]], -1, 255, 2)
+        cx, cy = pt(t.center)
+        cv2.circle(canvas, (cx, cy), 4, 255, -1)
+        put(canvas, f"B{t.id} ({cx}, {cy})", (cx + 8, cy - 8), 255)
+        if ball:
+            cv2.line(canvas, (cx, cy), pt(ball["center"]), 100, 1)
+            put(canvas, relative(t.center, ball, scale), (cx + 8, cy + 12), 255, 0.45)
+
+    if ball:
+        bc, r = pt(ball["center"]), int(round(ball["radius"]))
+        cv2.circle(canvas, bc, r, 255, 2)
+        put(canvas, f"Ball ({bc[0]}, {bc[1]})", (max(bc[0] - r, 5), max(bc[1] - r - 10, 45)), 255)
+
+    put(canvas, f"Blue objects: {len(tracks)}", (10, 25), 255, 0.6)
+    return canvas
+
+
+def show_mask(name, mask, text):
+    """Show a mask with a line of text saying what it is and which keys change it."""
+    img = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    put(img, text, (10, 25), size=0.6)
+    cv2.imshow(name, img)
+
+
 def main():
-    cap = cv2.VideoCapture(SOURCE)
+    if sys.platform == "win32":
+        cap = cv2.VideoCapture(SOURCE, cv2.CAP_DSHOW)  # Windows camera backend
+    else:
+        cap = cv2.VideoCapture(SOURCE)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     if not cap.isOpened():
         raise SystemExit(f"Could not open video source {SOURCE!r}")
 
+    calib = load_calibration()
     pipe = Pipeline(MARKER_CM, MIN_BLUE_AREA, MIN_BALL_AREA)
     show_masks = False
+    show_mono = True  # black and white window
     maker = None  # BallMaskMaker while it is open
 
     cv2.namedWindow("Tracker")
@@ -463,6 +531,9 @@ def main():
         ok, frame = cap.read()
         if not ok:
             break
+        # the calibration was made on unflipped frames, so undistort before mirroring
+        if calib and (frame.shape[1], frame.shape[0]) == calib[2]:
+            frame = cv2.undistort(frame, calib[0], calib[1])
         if MIRROR:
             frame = cv2.flip(frame, 1)
 
@@ -477,9 +548,13 @@ def main():
         frame_w = frame.shape[1]
         view = draw_camera(frame.copy(), result, pipe.scale)
         cv2.imshow("Tracker", np.hstack([view, draw_panel(frame.shape[0], result, pipe.scale)]))
+        if show_mono:
+            cv2.imshow("Mono view", draw_mono(frame.shape, result, pipe.scale))
         if show_masks:
-            cv2.imshow("Blue mask", result["blue_mask"])
-            cv2.imshow("Ball mask", result["ball_mask"])
+            show_mask("Blue mask", result["blue_mask"],
+                      "white = blue | click a blue object: new colour | r: reset | m: hide")
+            show_mask("Ball mask", result["ball_mask"],
+                      "white = ball | b: change with sliders | m: hide")
 
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), 27):
@@ -491,6 +566,10 @@ def main():
             pipe.tracker.reset()
         elif key == ord("b"):
             maker = BallMaskMaker(pipe)
+        elif key == ord("w"):
+            show_mono = not show_mono
+            if not show_mono:
+                cv2.destroyWindow("Mono view")
         elif key == ord("m"):
             show_masks = not show_masks
             if not show_masks:
